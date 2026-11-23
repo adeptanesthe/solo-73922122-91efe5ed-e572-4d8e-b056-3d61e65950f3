@@ -1,0 +1,5 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+# 仅测试需要：TestClient 依赖 httpx
+pytest>=8
+httpx>=0.27

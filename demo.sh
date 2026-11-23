@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 # 口述史馆检索 API 演示脚本
-# 场景：首查 → 撤稿 → 续页（跳过被撤版本、补足当页）→ 同号重刊
-#      → 旧游标看不到重刊版 / 新检索能看到 → 撤稿不必等计分结束
+# 场景：
+#   1) 首查 → 撤稿 → 续页（跳过被撤版本、补足当页）
+#   2) 同号重刊 → 旧游标看不到重刊版 / 新检索能看到
+#   3) 撤稿不必等计分结束
+#   4) 索引升级：模拟升级前旧库（索引未补齐），升级前签发的游标续页仍可用；
+#      续页先走原路径，补齐后同一游标自动切到索引路径，只读命中版本的词频与稿长
+#   5) 切到索引后，补齐期间的刊撤仍按旧游标规则生效
+#   （补齐出错/重启续补由 tests/test_api.py 与 README 的独立探测覆盖）
 # 用法：先启动服务（docker compose up --build 或本地 uvicorn），再执行 ./demo.sh
+# 注意：脚本按空库设计；重复演示请 docker compose down -v 或换一个新 DB。
 set -euo pipefail
 
 BASE="${BASE_URL:-http://127.0.0.1:8000}"
 
-post() { # path body
-  curl -sS -X POST "$BASE$1" -H 'Content-Type: application/json' -d "$2"
+post() { # path [body]
+  local path="$1" body="${2:-}"
+  if [ -z "$body" ]; then
+    curl -sS -X POST "$BASE$path"
+  else
+    curl -sS -X POST "$BASE$path" -H 'Content-Type: application/json' -d "$body"
+  fi
 }
 
 publish() { # doc_id tokens-json
@@ -16,6 +28,8 @@ publish() { # doc_id tokens-json
 }
 
 hr() { echo; echo "================================================================"; }
+require_jq() { command -v jq >/dev/null || { echo "需要 jq"; exit 1; }; }
+require_jq
 
 echo "目标服务: $BASE"
 
@@ -98,7 +112,68 @@ echo "   慢检索仍按其首查时刻的快照返回（MS-002 在结果中）�
 jq -c '[.hits[].doc_id]' /tmp/slow_search.json
 
 hr
-echo "10) 稿件版本终态"
+echo "10) 索引升级：把当前库还原成「升级前旧库」（索引未补齐），并暂停后台补齐"
+echo "--- 先补 12 篇与查询无关的在刊稿，用作「全库词频读取量」的对照"
+for i in $(seq 1 12); do
+  publish "MS-1$(printf '%02d' "$i")" "[\"知青\",\"下乡\",\"麦田\",\"编号$i\"]" >/dev/null
+done
+post '/index/rebuild?pause=true' '' | jq -c .
+curl -sS "$BASE/index/status" | jq -c .
+echo "--- 索引未就绪时首查，签发升级前游标 ---"
+legacy_first=$(post /search '{"terms":["抗战","北平"],"size":2}')
+echo "$legacy_first" | jq -c '{total_hits, hits:[.hits[].doc_id]}'
+legacy_cursor=$(echo "$legacy_first" | jq -r .next_cursor)
+
+echo "--- 升级前签发的游标：索引未就绪 → 续页走原路径，读取快照内全部在刊稿 ---"
+post /search/next "$(jq -nc --arg c "$legacy_cursor" '{cursor:$c,debug:true}')" \
+  | jq -c '{read_scope, remaining_hits, hits:[.hits[].doc_id]}'
+
+hr
+echo "11) 补齐期间照常刊发/撤稿/续页（无需等全库补完）"
+post /manuscripts '{"doc_id":"MS-008","tokens":["北平","胡同","抗战","老街","冬储"]}' | jq -c .
+post /manuscripts/MS-004/withdraw '' | jq -c .
+echo "--- 暂停状态下手动推进一批（背景线程不参与，进度可复现）"
+post '/index/backfill?batches=1' '' | jq -c .
+curl -sS "$BASE/index/status" | jq -c '{indexed_seq,latest_version,ready}'
+echo "--- 索引仍未就绪：升级前游标继续走原路径（此结果作为对照基准）"
+scan_ref=$(post /search/next "$(jq -nc --arg c "$legacy_cursor" '{cursor:$c,debug:true}')")
+echo "$scan_ref" | jq -c '{read_scope, remaining_hits, hits:[.hits[].doc_id]}'
+if [ "$(echo "$scan_ref" | jq -r .read_scope.path)" = "scan" ]; then
+  echo "✓ 补齐未完成，续页自动回退原路径"
+else
+  echo "✗ 索引未就绪却走了索引路径"; exit 1
+fi
+
+hr
+echo "12) 继续补齐到「索引就绪」，同一升级前游标自动切到索引路径"
+post /index/resume '' | jq -c .
+post '/index/backfill?batches=100' '' | jq -c .
+curl -sS "$BASE/index/status" | jq -c '{indexed_seq,latest_version,ready}'
+idx_path=$(post /search/next "$(jq -nc --arg c "$legacy_cursor" '{cursor:$c,debug:true}')")
+echo "$idx_path" | jq -c '{read_scope, remaining_hits, hits:[.hits[].doc_id]}'
+if [ "$(echo "$scan_ref" | jq -c '[.hits[]|{doc_id,score}]')" = \
+     "$(echo "$idx_path" | jq -c '[.hits[]|{doc_id,score}]')" ] \
+   && [ "$(echo "$scan_ref" | jq .remaining_hits)" = "$(echo "$idx_path" | jq .remaining_hits)" ] \
+   && [ "$(echo "$idx_path" | jq -r .read_scope.path)" = "index" ] \
+   && [ "$(echo "$idx_path" | jq .read_scope.docs_scored)" -lt \
+        "$(echo "$scan_ref" | jq .read_scope.docs_scored)" ]; then
+  echo "✓ 切索引后分数/顺序/剩余命中数与原路径一致，且只读命中版本的词频与稿长"
+  echo "  原路径读取 $(echo "$scan_ref" | jq .read_scope.docs_scored) 个在刊版本；" \
+       "索引路径只读 $(echo "$idx_path" | jq .read_scope.docs_scored) 个命中版本（含已撤候选会被过滤）"
+else
+  echo "✗ 索引路径与原路径不一致"; exit 1
+fi
+
+hr
+echo "13) 索引就绪后的稳态：新检索/续页全程走索引"
+post /search '{"terms":["抗战","北平"],"size":100}' | jq -c '[.hits[]|{doc_id,version,score}]'
+steady=$(post /search '{"terms":["抗战"],"size":2}')
+steady_cursor=$(echo "$steady" | jq -r .next_cursor)
+post /search/next "$(jq -nc --arg c "$steady_cursor" '{cursor:$c,debug:true}')" \
+  | jq -c '{read_scope, hits:[.hits[].doc_id]}'
+
+hr
+echo "14) 稿件版本终态"
 curl -sS "$BASE/manuscripts" | jq '[.manuscripts[]|{version,doc_id,status}]'
 echo
 echo "演示完成。"

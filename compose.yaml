@@ -6,9 +6,19 @@ services:
       - "8000:8000"
     environment:
       DB_PATH: /data/oral_history.db
+      # 索引续页；旧库首次启动会在后台从 0 分批补齐
+      INDEX_ENABLED: "1"
+      INDEX_BATCH_SIZE: "200"
     volumes:
       - search_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
 volumes:
   search_data:

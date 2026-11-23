@@ -6,15 +6,24 @@
   续页时用冻结的统计重算分数，跳过当前已撤稿的版本，从后续命中补足当页。
 - 同号重刊得到新的版本序号，只进入重刊后新开的检索。
 - SQLite 开 WAL、每请求独立连接、写事务尽量短，撤稿不必等正在计分的请求结束。
+
+索引加速（/search/next）：
+- `term_index(term, version)` 是语料级倒排索引，不按游标保存榜单。
+- 索引覆盖到某游标首查时的版本高水位后，续页只按查询词从索引定位候选版本，
+  再只为这些候选读取 tf / length；语料统计仍用首查冻结的 N、avgdl、df。
+- 旧库在后台按版本分批、每批独立事务补齐索引；进度写入 index_meta，
+  重启后从上次提交处继续。补齐未完成或出错时，续页自动回退到全量重算。
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -31,6 +40,23 @@ K1 = 1.2
 B = 0.75
 
 MAX_PAGE_SIZE = 100
+
+# 索引：语料级倒排（term -> version），与游标无关；旧库由后台按版本分批补齐
+INDEX_ENABLED = os.environ.get("INDEX_ENABLED", "1").lower() not in ("0", "false", "no")
+INDEX_BACKFILL_ENABLED = (
+    INDEX_ENABLED
+    and os.environ.get("INDEX_BACKFILL_ENABLED", "1").lower() not in ("0", "false", "no")
+)
+INDEX_BATCH_SIZE = max(1, int(os.environ.get("INDEX_BATCH_SIZE", "200")))
+INDEX_IDLE_SECONDS = max(0.01, float(os.environ.get("INDEX_IDLE_SECONDS", "0.05")))
+_INDEX_FETCH_CHUNK = 500  # IN (...) 的参数上限留足余量
+
+# 后台补齐可暂停（运维/演示用）：暂停期间 publish 仍会写索引，只是高水位不推进
+_BACKFILL_PAUSED = threading.Event()
+# 串行化补齐批次：同步接口与后台线程不会同时写 index_meta，测试/运维也用它暂停
+_BACKFILL_LOCK = threading.Lock()
+
+log = logging.getLogger("oral_history.index")
 
 
 # ------------------------------------------------------------------ 数据库
@@ -78,19 +104,205 @@ def _init_db() -> None:
                 dfs          TEXT NOT NULL,        -- 各查询词的 df(JSON 对象)
                 created_at   TEXT NOT NULL
             );
+
+            -- 语料级倒排索引：每个 (版本, 词) 一行，与游标/榜单无关。
+            -- 续页从这里定位候选版本，再只读取这些版本的 tf / length。
+            CREATE TABLE IF NOT EXISTS term_index (
+                term    TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                PRIMARY KEY (term, version)
+            ) WITHOUT ROWID;
+
+            -- 索引补齐进度：indexed_seq 之前的版本已全部写入 term_index。
+            -- 后台每批独立提交；重启后从此处继续。
+            CREATE TABLE IF NOT EXISTS index_meta (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                indexed_seq INTEGER NOT NULL,   -- 已补齐到的高水位
+                updated_at  TEXT NOT NULL,
+                last_error  TEXT
+            );
+            INSERT OR IGNORE INTO index_meta (id, indexed_seq, updated_at)
+                VALUES (1, 0, '');
             """
         )
     finally:
         conn.close()
 
 
+# ------------------------------------------------------------------ 倒排索引
+
+def _index_entry(conn: sqlite3.Connection, version: int, tf: dict[str, int]) -> None:
+    """把一个版本的词频表写入倒排索引；只收非空、计数为正的词（与计分一致）。"""
+    conn.executemany(
+        "INSERT OR IGNORE INTO term_index (term, version) VALUES (?, ?)",
+        [(t, version) for t, f in tf.items() if t and f],
+    )
+
+
+def _candidate_versions(
+    conn: sqlite3.Connection, terms: list[str], max_version: int
+) -> Optional[set[int]]:
+    """按查询词从索引取候选版本（<= max_version）。索引未就绪时返回 None。
+
+    调用方负责开启/提交读事务，使索引查询与在刊状态读取处于同一快照。
+    """
+    if not INDEX_ENABLED:
+        return None
+    row = conn.execute("SELECT indexed_seq FROM index_meta WHERE id = 1").fetchone()
+    if row is None or row["indexed_seq"] < max_version:
+        return None
+    versions: set[int] = set()
+    for chunk_start in range(0, len(terms), _INDEX_FETCH_CHUNK):
+        chunk = terms[chunk_start:chunk_start + _INDEX_FETCH_CHUNK]
+        ph = ",".join("?" for _ in chunk)
+        for r in conn.execute(
+            f"SELECT DISTINCT version FROM term_index"
+            f" WHERE term IN ({ph}) AND version <= ?",
+            (*chunk, max_version),
+        ):
+            versions.add(r["version"])
+    return versions
+
+
+def _fetch_published_by_version(
+    conn: sqlite3.Connection, versions: set[int]
+) -> list[tuple[str, int, dict, int]]:
+    """只为索引命中的候选版本读取 doc_id / tf / length，并按同一快照过滤在刊状态。"""
+    docs = []
+    ordered = sorted(versions)
+    for start in range(0, len(ordered), _INDEX_FETCH_CHUNK):
+        chunk = ordered[start:start + _INDEX_FETCH_CHUNK]
+        ph = ",".join("?" for _ in chunk)
+        for r in conn.execute(
+            f"SELECT version, doc_id, tf, length FROM manuscripts"
+            f" WHERE version IN ({ph}) AND status = 'published'",
+            chunk,
+        ):
+            docs.append((r["doc_id"], r["version"], json.loads(r["tf"]), r["length"]))
+    return docs
+
+
+def _index_meta(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        "SELECT indexed_seq, updated_at, last_error FROM index_meta WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return {"indexed_seq": 0, "updated_at": None, "last_error": None}
+    return dict(row)
+
+
+def _backfill_once(
+    conn: sqlite3.Connection, batch_size: Optional[int] = None
+) -> tuple[int, Optional[str]]:
+    """补齐一批版本（<= batch_size），单个写事务提交；返回 (写入数, 错误)。
+
+    只推进到本批最后一个**成功写入**的版本，因此中断后从该处接着补，
+    不会留下空洞。新增版本即使大于当前进度也不会漏补：进度按版本升序推进。
+    已追上最新版本时只做一次读检查，不取写锁，避免空闲时持续阻塞刊发/撤稿。
+    """
+    if batch_size is None:
+        batch_size = INDEX_BATCH_SIZE
+    meta = conn.execute(
+        "SELECT indexed_seq FROM index_meta WHERE id = 1"
+    ).fetchone()
+    indexed_seq = meta["indexed_seq"] if meta else 0
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS v FROM manuscripts"
+    ).fetchone()["v"]
+    if latest <= indexed_seq:
+        return 0, None
+
+    connected = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        connected = True
+        meta = conn.execute(
+            "SELECT indexed_seq FROM index_meta WHERE id = 1"
+        ).fetchone()
+        indexed_seq = meta["indexed_seq"] if meta else 0
+        rows = conn.execute(
+            "SELECT version, tf FROM manuscripts"
+            " WHERE version > ? ORDER BY version LIMIT ?",
+            (indexed_seq, batch_size),
+        ).fetchall()
+        if not rows:
+            conn.execute("COMMIT")
+            return 0, None
+
+        inserted = 0
+        for r in rows:
+            before = conn.total_changes
+            _index_entry(conn, r["version"], json.loads(r["tf"]))
+            inserted += conn.total_changes - before
+        new_seq = rows[-1]["version"]
+        conn.execute(
+            "UPDATE index_meta SET indexed_seq = ?, updated_at = ?, last_error = NULL"
+            " WHERE id = 1",
+            (new_seq, _utcnow()),
+        )
+        conn.execute("COMMIT")
+        return inserted, None
+    except Exception as exc:  # 记录错误但保留已提交进度，续页仍可走原路径
+        if connected:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        msg = f"{type(exc).__name__}: {exc}"
+        try:
+            conn.execute(
+                "UPDATE index_meta SET last_error = ?, updated_at = ? WHERE id = 1",
+                (msg, _utcnow()),
+            )
+        except sqlite3.Error:
+            pass  # 数据库暂时不可写：错误由返回值/后台循环日志体现
+        return 0, msg
+
+
+def _backfill_worker(stop: threading.Event) -> None:
+    """后台补齐循环：一批一提交，直到追上最新版本；出错后退避重试。"""
+    while not stop.is_set():
+        if _BACKFILL_PAUSED.is_set():
+            stop.wait(INDEX_IDLE_SECONDS)
+            continue
+        try:
+            conn = _connect()
+            try:
+                with _BACKFILL_LOCK:
+                    inserted, err = _backfill_once(conn)
+            finally:
+                conn.close()
+            if err:
+                log.warning("索引补齐出错，稍后重试: %s", err)
+                stop.wait(max(1.0, INDEX_IDLE_SECONDS * 20))
+            elif inserted == 0:
+                stop.wait(INDEX_IDLE_SECONDS)
+            else:
+                stop.wait(min(0.2, INDEX_IDLE_SECONDS))
+        except Exception as exc:  # 数据库暂时不可用等：不退出补齐线程
+            log.warning("索引补齐循环异常: %s", exc)
+            stop.wait(1.0)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _init_db()
-    yield
+    stop = threading.Event()
+    worker: Optional[threading.Thread] = None
+    if INDEX_BACKFILL_ENABLED:
+        worker = threading.Thread(
+            target=_backfill_worker, args=(stop,), name="index-backfill", daemon=True
+        )
+        worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if worker is not None:
+            worker.join(timeout=5.0)
 
 
-app = FastAPI(title="口述史馆检索 API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="口述史馆检索 API", version="1.1.0", lifespan=lifespan)
 
 
 def _utcnow() -> str:
@@ -177,6 +389,8 @@ class ContinueRequest(BaseModel):
     cursor: str = Field(description="上一页返回的 next_cursor")
     size: Optional[int] = Field(default=None, ge=1, le=MAX_PAGE_SIZE,
                                 description="缺省沿用首查页长")
+    debug: bool = Field(default=False,
+                        description="附带读取范围诊断字段（候选数 / 快照在刊总数）")
 
 
 def _resolve_terms(req: SearchRequest) -> list[str]:
@@ -209,12 +423,28 @@ def publish_manuscript(req: PublishRequest):
                 (req.doc_id, json.dumps(tokens, ensure_ascii=False),
                  json.dumps(tf, ensure_ascii=False), len(tokens), _utcnow()),
             )
+            version = cur.lastrowid
+            # 新刊版本在同一写事务内写入倒排索引。若此前索引恰好补齐到
+            # 上一个版本（稳态），可原子地把高水位推进到本版本；若补齐仍在
+            # 追赶，则保持高水位不动，由后台按版本顺序补齐。
+            # （旧实例不写索引也不会被跳过：它们的版本会让高水位条件不满足，
+            #   由补齐扫描补上。）
+            if INDEX_ENABLED:
+                _index_entry(conn, version, tf)
+                row = conn.execute(
+                    "SELECT indexed_seq FROM index_meta WHERE id = 1"
+                ).fetchone()
+                if row is not None and row["indexed_seq"] == version - 1:
+                    conn.execute(
+                        "UPDATE index_meta SET indexed_seq = ?, updated_at = ?"
+                        " WHERE id = 1",
+                        (version, _utcnow()),
+                    )
             conn.execute("COMMIT")
         except sqlite3.IntegrityError:
             conn.execute("ROLLBACK")
             raise HTTPException(status_code=409,
                                 detail=f"稿号 {req.doc_id} 已有在刊版本，请先撤稿再重刊")
-        version = cur.lastrowid
     finally:
         conn.close()
     return {"doc_id": req.doc_id, "version": version, "status": "published",
@@ -319,7 +549,11 @@ def first_search(req: SearchRequest):
 
 @app.post("/search/next")
 def continue_search(req: ContinueRequest):
-    """续页：沿用首查的分数与顺序，跳过已撤稿版本，从后续命中补足当页。"""
+    """续页：沿用首查的分数与顺序，跳过已撤稿版本，从后续命中补足当页。
+
+    索引就绪（indexed_seq >= 首查 snapshot_seq）时，只按查询词从 term_index
+    定位候选版本，再读取这些版本的 tf / length；否则回退到原来的全量路径。
+    """
     search_id, after_score, after_doc_id = _decode_cursor(req.cursor)
 
     conn = _connect()
@@ -329,14 +563,25 @@ def continue_search(req: ContinueRequest):
         if srow is None:
             conn.execute("ROLLBACK")
             raise HTTPException(status_code=404, detail="游标不存在或已过期")
-        # 只取首查快照内的版本；本次请求前已撤稿的版本在此被跳过；
-        # 重刊版本 version > snapshot_seq，不会进入本次检索
-        docs = _load_published_docs(conn, max_version=srow["snapshot_seq"])
+        terms = json.loads(srow["terms"])
+        # 索引与在刊状态在同一读事务里读取：候选版本和状态过滤出自同一快照。
+        # 只取首查快照内的版本；本次请求前已撤稿的版本被跳过；
+        # 重刊版本 version > snapshot_seq，不会进入本次检索。
+        candidate_versions = _candidate_versions(
+            conn, terms, srow["snapshot_seq"]
+        )
+        if candidate_versions is None:
+            docs = _load_published_docs(conn, max_version=srow["snapshot_seq"])
+            path = "scan"
+            index_hits = 0
+        else:
+            docs = _fetch_published_by_version(conn, candidate_versions)
+            path = "index"
+            index_hits = len(candidate_versions)
         conn.execute("COMMIT")
     finally:
         conn.close()
 
-    terms = json.loads(srow["terms"])
     dfs = json.loads(srow["dfs"])
     size = req.size if req.size is not None else srow["size"]
 
@@ -352,13 +597,23 @@ def continue_search(req: ContinueRequest):
         _encode_cursor(search_id, page[-1]["score"], page[-1]["doc_id"])
         if len(remaining) > size else None
     )
-    return {
+    result = {
         "terms": terms,
         "size": size,
         "remaining_hits": len(remaining),
         "hits": page,
         "next_cursor": next_cursor,
     }
+    if req.debug:
+        # 读取范围诊断：index 路径只读候选版本；scan 路径读全部在刊快照。
+        result["read_scope"] = {
+            "path": path,
+            "index_candidates": index_hits,      # 索引定位到的候选版本数
+            "docs_scored": len(docs),            # 实际读取 tf/length 并计分的版本数
+            "snapshot_published": srow["n_docs"],  # 首查时在刊稿总数
+            "snapshot_seq": srow["snapshot_seq"],
+        }
+    return result
 
 
 # ------------------------------------------------------------------ 其他
@@ -378,5 +633,97 @@ def index():
             "list": "GET /manuscripts",
             "first_search": "POST /search",
             "continue_search": "POST /search/next",
+            "index_status": "GET /index/status",
+            "index_backfill": "POST /index/backfill",
+            "index_pause": "POST /index/pause",
+            "index_resume": "POST /index/resume",
+            "index_rebuild": "POST /index/rebuild",
         },
     }
+
+
+# ------------------------------------------------------------------ 索引运维
+
+@app.get("/index/status")
+def index_status():
+    """观察索引补齐进度：indexed_seq 追上最新版本即"索引就绪"。"""
+    conn = _connect()
+    try:
+        meta = _index_meta(conn)
+        latest = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM manuscripts"
+        ).fetchone()["v"]
+        rows = conn.execute("SELECT COUNT(*) AS c FROM term_index").fetchone()["c"]
+    finally:
+        conn.close()
+    return {
+        "enabled": INDEX_ENABLED,
+        "indexed_seq": meta["indexed_seq"],
+        "latest_version": latest,
+        "ready": INDEX_ENABLED and meta["indexed_seq"] >= latest,
+        "term_entries": rows,
+        "backfill_error": meta["last_error"],
+        "updated_at": meta["updated_at"],
+    }
+
+
+@app.post("/index/backfill")
+def index_backfill(batches: int = 1):
+    """同步补齐若干批（便于测试/运维推进）；后台线程仍会继续补齐。"""
+    if not INDEX_ENABLED:
+        raise HTTPException(status_code=409, detail="索引已禁用")
+    done = 0
+    last_err = None
+    conn = _connect()
+    try:
+        with _BACKFILL_LOCK:
+            for _ in range(max(1, min(batches, 1000))):
+                inserted, last_err = _backfill_once(conn)
+                done += inserted
+                if last_err or inserted == 0:
+                    break
+        meta = _index_meta(conn)
+    finally:
+        conn.close()
+    return {"inserted": done, "indexed_seq": meta["indexed_seq"],
+            "backfill_error": last_err}
+
+
+@app.post("/index/pause")
+def index_pause():
+    """暂停后台补齐（同步接口不受影响），用于演示/测试"补齐未完成"状态。"""
+    _BACKFILL_PAUSED.set()
+    return {"paused": True}
+
+
+@app.post("/index/resume")
+def index_resume():
+    _BACKFILL_PAUSED.clear()
+    return {"paused": False}
+
+
+@app.post("/index/rebuild")
+def index_rebuild(pause: bool = False):
+    """重建语料索引：清空 term_index、进度归零，由后台重新补齐。
+
+    用于演示/运维（例如怀疑索引损坏）。pause=true 时重建后保持"未就绪"状态，
+    便于复现升级前旧库（游标签发时索引尚未补齐）的行为。
+    """
+    if not INDEX_ENABLED:
+        raise HTTPException(status_code=409, detail="索引已禁用")
+    with _BACKFILL_LOCK:
+        if pause:
+            _BACKFILL_PAUSED.set()
+        conn = _connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM term_index")
+            conn.execute(
+                "UPDATE index_meta SET indexed_seq = 0, last_error = NULL, updated_at = ?"
+                " WHERE id = 1",
+                (_utcnow(),),
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    return {"rebuilt": True, "paused": _BACKFILL_PAUSED.is_set()}
